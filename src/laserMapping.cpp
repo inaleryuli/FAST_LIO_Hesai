@@ -151,6 +151,8 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
+V3D gyro_at_scan_end = V3D::Zero();
+bool gyro_at_scan_end_valid = false;
 vect3 pos_lid;
 
 nav_msgs::msg::Path path;
@@ -507,10 +509,67 @@ bool sync_packages(MeasureGroup &meas)
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
     }
+    
+    //find the angular velocity that matches the timestamp lidar_end_time
+    gyro_at_scan_end_valid = false;
+    if(!meas.imu.empty()){
+        const auto imu0 = meas.imu.back();
+        const double t0 = get_time_sec(imu0->header.stamp);
+
+        if(t0==lidar_end_time){
+            const V3D gyro0(
+            imu0->angular_velocity.x,
+            imu0->angular_velocity.y,
+            imu0->angular_velocity.z);
+            gyro_at_scan_end = gyro0;
+            gyro_at_scan_end_valid = true;
+        }
+    }
+
+    if(!gyro_at_scan_end_valid && !imu_buffer.empty()){
+        const auto imu1 = imu_buffer.front();
+        const double t1 = get_time_sec(imu1->header.stamp);
+
+        if(t1==lidar_end_time){
+            const V3D gyro1(
+            imu1->angular_velocity.x,
+            imu1->angular_velocity.y,
+            imu1->angular_velocity.z);
+            gyro_at_scan_end = gyro1;
+            gyro_at_scan_end_valid = true;  
+        }
+    }
+    if(!imu_buffer.empty() && !meas.imu.empty() && !gyro_at_scan_end_valid){
+        const auto imu0 = meas.imu.back();
+        const double t0 = get_time_sec(imu0->header.stamp);
+
+        const auto imu1 = imu_buffer.front();
+        const double t1 = get_time_sec(imu1->header.stamp);
+
+        if(t0<lidar_end_time && t1>lidar_end_time){
+            const V3D gyro0(
+                imu0->angular_velocity.x,
+                imu0->angular_velocity.y,
+                imu0->angular_velocity.z);
+
+            const V3D gyro1(
+                imu1->angular_velocity.x,
+                imu1->angular_velocity.y,
+                imu1->angular_velocity.z);
+
+            const double alpha = (lidar_end_time - t0) / (t1 - t0);
+            gyro_at_scan_end = (1.0 - alpha) * gyro0 + alpha * gyro1;
+            gyro_at_scan_end_valid = true;
+        }
+    }
+
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+
+
+
     return true;
 }
 
@@ -753,7 +812,32 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+
+    const V3D velocity_body = state_point.rot.toRotationMatrix().transpose() * state_point.vel;
+
+    odomAftMapped.twist.twist.linear.x = velocity_body.x();
+    odomAftMapped.twist.twist.linear.y = velocity_body.y();
+    odomAftMapped.twist.twist.linear.z = velocity_body.z();
+
+    const V3D angular_velocity_body = gyro_at_scan_end - state_point.bg;
+
+    odomAftMapped.twist.twist.angular.x = angular_velocity_body.x();
+    odomAftMapped.twist.twist.angular.y = angular_velocity_body.y();
+    odomAftMapped.twist.twist.angular.z = angular_velocity_body.z();
+
+    if(gyro_at_scan_end_valid)
+        pubOdomAftMapped->publish(odomAftMapped);
+    else {
+        static rclcpp::Clock warning_clock(RCL_STEADY_TIME);
+
+        RCLCPP_WARN_THROTTLE(
+            rclcpp::get_logger("gyro_sync"),
+            warning_clock,
+            2000,
+            "Skipping /Odometry at %.6f s: no valid gyro estimate.",
+            lidar_end_time);
+    }
+
     if (tum_save_en && fout_tum)
     {
         fout_tum << std::fixed << std::setprecision(9) << lidar_end_time << " "
